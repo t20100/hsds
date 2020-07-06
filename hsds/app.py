@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import os
+import threading
 
 from aiohttp import web
 
@@ -9,9 +10,31 @@ from . import hsds_logger as log
 
 
 async def start_app_runner(runner, address, port):
+    """Start AppRunner.
+
+    :param runner: Runner to serve from thread
+    :param str address: See :class:`aiohttp.web.TCPSite`
+    :param int port: See :class:`aiohttp.web.TCPSite`
+    """
     await runner.setup()
     site = web.TCPSite(runner, address, port)
     await site.start()
+
+
+def run_runner_in_thread(runner, address, port):
+    """Run a runner in a thread.
+
+    :param runner: Runner to serve from thread
+    :param str address: See :class:`aiohttp.web.TCPSite`
+    :param int port: See :class:`aiohttp.web.TCPSite`
+    """
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(runner.setup())
+    site = web.TCPSite(runner, address, port)
+    loop.run_until_complete(site.start())
+    loop.run_forever()
+    loop.run_until_complete(runner.cleanup())  # TODO how to close?
 
 
 _HELP_USAGE = "Starts hsds a REST-based service for HDF5 data."
@@ -26,6 +49,7 @@ _HELP_EPILOG = """Examples:
 
   hsds --bucket-dir ./data/hsds.test
 """
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -64,13 +88,11 @@ def main():
     args, extra_args = parser.parse_known_args()
 
     config.cfg['standalone_app'] = 'True'
-    config.cfg['target_sn_count'] = '1'
-    config.cfg['target_dn_count'] = '1'
-    config.cfg['head_endpoint'] = 'http://localhost:' + str(config.get('head_port'))
+    #config.cfg['head_endpoint'] = 'http://localhost:' + str(config.get('head_port'))
 
     address = '%s:%d' % (args.host, args.port)
-    config.cfg['sn_port'] = str(args.port)
-    config.cfg['hsds_endpoint'] = 'http://' + address
+    #config.cfg['sn_port'] = str(args.port)
+    #config.cfg['hsds_endpoint'] = 'http://' + address
     config.cfg['public_dns'] = address
 
     config.cfg['password_file'] = args.password_file[0]
@@ -98,21 +120,33 @@ def main():
     log.info("Creating runners")
 
     head_runner = web.AppRunner(headnode.create_app(loop))
-    dn_runner = web.AppRunner(datanode.create_app(loop))
-    sn_runner = web.AppRunner(servicenode.create_app(loop))
 
     log.info('Runners created')
 
     loop.run_until_complete(start_app_runner(
         head_runner, 'localhost', config.get('head_port')))
-    loop.run_until_complete(start_app_runner(
-        dn_runner, 'localhost', config.get('dn_port')))
-    loop.run_until_complete(start_app_runner(
-        sn_runner, 'localhost', config.get('sn_port')))
+    runners = [head_runner]
+
+    # Starts DN and SN in threads
+    dn_threads = []
+    for index in range(int(config.get('target_dn_count'))):
+        dn_runner = web.AppRunner(datanode.create_app(loop))
+        runners.append(dn_runner)
+        dn_threads.append(threading.Thread(
+            target=run_runner_in_thread,
+            args=(dn_runner, 'localhost', config.get('dn_port') + index)))
+        dn_threads[-1].start()
+
+    sn_threads = []
+    for index in range(int(config.get('target_sn_count'))):
+        sn_runner = web.AppRunner(servicenode.create_app(loop))
+        runners.append(sn_runner)
+        sn_threads.append(threading.Thread(
+            target=run_runner_in_thread,
+            args=(sn_runner, 'localhost', config.get('sn_port') + index)))
+        sn_threads[-1].start()
 
     log.info('Loop about to start')
-
-    runners = [head_runner, dn_runner, sn_runner]
 
     try:
         loop.run_forever()
